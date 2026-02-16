@@ -1,8 +1,2 @@
-streamlit==1.31.0
-moviepy==1.0.3
-Pillow==10.2.0
-imageio==2.34.0
-imageio-ffmpeg==0.4.9
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
-pygifsicle==1.0.7
+streamlit
+moviepy
