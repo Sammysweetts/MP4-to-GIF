@@ -1,1 +1,1 @@
-# Video-to-GIF
+# MP4-to-GIF
