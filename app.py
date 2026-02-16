@@ -8,7 +8,6 @@ from pathlib import Path
 import streamlit as st
 from imageio_ffmpeg import get_ffmpeg_exe
 
-
 st.set_page_config(page_title="Video → GIF", layout="centered")
 
 FFMPEG_PATH = get_ffmpeg_exe()
@@ -31,11 +30,10 @@ def run(cmd: list[str]) -> tuple[int, str]:
 def probe_video_with_ffmpeg(video_path: str) -> dict:
     """
     Uses `ffmpeg -i` output to parse duration, fps, width, height.
-    This avoids MoviePy (which can trigger PIL.Image.ANTIALIAS issues with Pillow>=10).
+    Avoids MoviePy/Pillow compatibility issues.
     """
     cmd = [FFMPEG_PATH, "-hide_banner", "-i", video_path]
     rc, log = run(cmd)
-    # Note: ffmpeg -i typically returns non-zero; we parse the log anyway.
 
     # Duration
     duration = 0.0
@@ -55,12 +53,12 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
     fps = 0.0
 
     if video_line:
-        # Resolution: look for "####x####" near the Video line
+        # Resolution
         m2 = re.search(r"(\d{2,5})x(\d{2,5})", video_line)
         if m2:
             width, height = int(m2.group(1)), int(m2.group(2))
 
-        # FPS: prefer "... 29.97 fps", else fall back to "... 30 tbr"
+        # FPS: prefer "... 29.97 fps", else fallback to "... 30 tbr"
         m3 = re.search(r"(\d+(?:\.\d+)?)\s*fps", video_line)
         if m3:
             fps = float(m3.group(1))
@@ -72,12 +70,32 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
     return {"duration": duration, "fps": fps, "width": width, "height": height, "raw_log": log}
 
 
+def gif_safe_fps(requested_fps: float, min_delay_cs: int = 2) -> tuple[float, str, int]:
+    """
+    GIF frame delays are stored in centiseconds (1/100 s). Many players also clamp very small delays.
+    If you ask for e.g. 60 fps (16.67 ms), it often gets rounded/clamped to 20 ms -> plays slower.
+
+    We quantize to an *exactly representable* GIF frame delay:
+      delay_cs = round(100 / fps), but at least min_delay_cs (default 2 -> 20 ms -> max 50 fps).
+      effective_fps = 100 / delay_cs (exact)
+    Returns: (effective_fps_float, ffmpeg_fps_expr, delay_cs)
+    """
+    if not requested_fps or requested_fps <= 0:
+        requested_fps = 15.0
+
+    delay_cs = int(round(100.0 / float(requested_fps)))
+    delay_cs = max(min_delay_cs, min(100, delay_cs))  # clamp to [min_delay_cs..100]
+    fps_expr = f"100/{delay_cs}"  # exact rational in ffmpeg
+    effective_fps = 100.0 / delay_cs
+    return effective_fps, fps_expr, delay_cs
+
+
 def video_to_gif(
     input_path: str,
     output_path: str,
     start_s: float,
     end_s: float,
-    out_fps: float,
+    fps_expr: str,
     scale_pct: int,
     max_colors: int,
     dither: str,
@@ -90,10 +108,8 @@ def video_to_gif(
     scale_factor = max(1, int(scale_pct)) / 100.0
 
     # High-quality GIF approach: palettegen + paletteuse
-    # - Keeps video layout/aspect ratio (no crop)
-    # - Uses lanczos scaler for best down/up-scaling quality
     vf = (
-        f"fps={out_fps},"
+        f"fps={fps_expr},"
         f"scale=iw*{scale_factor}:ih*{scale_factor}:flags=lanczos,"
         f"split[s0][s1];"
         f"[s0]palettegen=max_colors={max_colors}:stats_mode=diff[p];"
@@ -126,10 +142,10 @@ st.title("Video → GIF (quality-focused)")
 
 st.markdown(
     """
-**Your requirements covered:**
-1. **Best possible GIF quality** using `palettegen/paletteuse` (GIF still has a hard 256-color limit).
-2. **Match the video FPS by default**, with a regulator to increase/decrease output FPS.
-3. **Same layout as the video** (no cropping; aspect ratio preserved; default is full resolution).
+**Notes about speed (important):**
+- GIF stores frame delays in **1/100 second** steps (centiseconds).
+- If you request FPS that doesn't map cleanly to that (common: **60 fps**), many GIFs end up playing **slower** due to rounding/clamping.
+- This app automatically adjusts your requested FPS to a **GIF-safe FPS** so playback speed matches the original timing much better.
 """
 )
 
@@ -168,7 +184,7 @@ with col2:
 st.divider()
 st.subheader("GIF settings")
 
-detected_fps = float(info["fps"] or 15.0)
+detected_fps = float(info["fps"] or 30.0)
 duration = float(info["duration"] or 0.0)
 
 if duration > 0:
@@ -189,17 +205,27 @@ else:
 use_original_fps = st.checkbox("Use original video FPS (recommended)", value=True)
 
 if use_original_fps:
-    out_fps = detected_fps
-    st.caption(f"Output FPS set to detected FPS: {out_fps:.3f}")
+    requested_fps = detected_fps
 else:
-    out_fps = st.slider(
-        "Output GIF FPS (regulator)",
-        min_value=1,
-        max_value=60,
-        value=min(60, max(1, int(round(detected_fps)))),
-        step=1,
-        help="Lower FPS reduces size; higher FPS increases smoothness (may duplicate frames if higher than source).",
+    requested_fps = float(
+        st.slider(
+            "Output GIF FPS (regulator)",
+            min_value=1,
+            max_value=60,
+            value=min(60, max(1, int(round(detected_fps)))),
+            step=1,
+            help="Lower FPS reduces size; higher FPS increases smoothness. Non-GIF-safe FPS can play slower due to GIF timing limits, so we auto-adjust.",
+        )
     )
+
+# Make FPS GIF-safe to avoid slow playback due to centisecond rounding/clamping
+effective_fps, fps_expr, delay_cs = gif_safe_fps(requested_fps, min_delay_cs=2)
+
+st.caption(
+    f"Requested FPS: {requested_fps:.3f} → **GIF-safe FPS: {effective_fps:.6f}** "
+    f"(frame delay = {delay_cs} cs = {delay_cs*10} ms). "
+    f"This prevents the common 'GIF plays slower than video' issue."
+)
 
 scale_pct = st.select_slider(
     "Output size (keeps same layout/aspect ratio)",
@@ -229,6 +255,7 @@ st.session_state.gif_name = Path(uploaded.name).stem + ".gif"
 if st.button("Generate GIF", type="primary"):
     st.session_state.gif_bytes = None
 
+    gif_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".gif") as out_tmp:
             gif_path = out_tmp.name
@@ -239,7 +266,7 @@ if st.button("Generate GIF", type="primary"):
                 output_path=gif_path,
                 start_s=float(start_s),
                 end_s=float(end_s),
-                out_fps=float(out_fps),
+                fps_expr=fps_expr,  # IMPORTANT: GIF-safe FPS expression
                 scale_pct=int(scale_pct),
                 max_colors=int(max_colors),
                 dither=str(dither),
@@ -256,7 +283,7 @@ if st.button("Generate GIF", type="primary"):
 
     finally:
         try:
-            if "gif_path" in locals() and os.path.exists(gif_path):
+            if gif_path and os.path.exists(gif_path):
                 os.remove(gif_path)
         except Exception:
             pass
@@ -266,7 +293,6 @@ st.subheader("GIF preview (before download)")
 
 if st.session_state.gif_bytes:
     st.image(st.session_state.gif_bytes, caption="Preview", use_container_width=True)
-
     st.download_button(
         "Download GIF",
         data=st.session_state.gif_bytes,
