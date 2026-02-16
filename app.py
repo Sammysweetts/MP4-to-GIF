@@ -22,53 +22,30 @@ def human_size(num_bytes: int) -> str:
 
 
 def run(cmd: list[str]) -> tuple[int, str]:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # We use explicit encoding/errors to prevent crashes on weird log characters
+    p = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"
+    )
     log = (p.stderr or "") + ("\n" + p.stdout if p.stdout else "")
     return p.returncode, log
 
 
-def parse_rotation_from_ffmpeg_log(log: str) -> int:
-    """
-    Many portrait phone videos are stored as landscape frames + rotation metadata.
-    If we don't apply that rotation, the output GIF "layout" looks wrong.
-
-    Returns rotation in {0, 90, 180, 270}.
-    """
-    # Common forms:
-    #   rotate          : 90
-    #   Side data: displaymatrix: rotation of 90.00 degrees
-    m = re.search(r"rotate\s*:\s*(-?\d+(?:\.\d+)?)", log)
-    if not m:
-        m = re.search(r"rotation of\s*(-?\d+(?:\.\d+)?)\s*degrees", log, flags=re.IGNORECASE)
-
-    if not m:
-        return 0
-
-    deg = float(m.group(1))
-    deg = int(round(deg)) % 360
-    # Normalize to nearest right angle
-    candidates = [0, 90, 180, 270]
-    deg = min(candidates, key=lambda x: abs(x - deg))
-    return deg
-
-
 def probe_video_with_ffmpeg(video_path: str) -> dict:
     """
-    Uses `ffmpeg -i` output to parse duration, fps, width, height, rotation.
-    Avoids MoviePy (Pillow>=10 issues with ANTIALIAS).
+    Uses `ffmpeg -i` to parse duration, fps, resolution.
+    We trust FFmpeg's display output here.
     """
     cmd = [FFMPEG_PATH, "-hide_banner", "-i", video_path]
     rc, log = run(cmd)
-    # Note: ffmpeg -i typically returns non-zero; we parse the log anyway.
 
-    # Duration
     duration = 0.0
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", log)
     if m:
         hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
         duration = hh * 3600 + mm * 60 + ss
 
-    # Find first video stream line
+    # Regex to find video stream info
+    # We look for "Video: ..., 1920x1080, ..." pattern
     video_line = None
     for line in log.splitlines():
         if "Stream #" in line and "Video:" in line:
@@ -79,12 +56,12 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
     fps = 0.0
 
     if video_line:
-        # Resolution: look for "####x####"
+        # 1. Resolution
         m2 = re.search(r"(\d{2,5})x(\d{2,5})", video_line)
         if m2:
             width, height = int(m2.group(1)), int(m2.group(2))
 
-        # FPS: prefer "... 29.97 fps", else fallback to "... 30 tbr"
+        # 2. FPS
         m3 = re.search(r"(\d+(?:\.\d+)?)\s*fps", video_line)
         if m3:
             fps = float(m3.group(1))
@@ -92,50 +69,42 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
             m4 = re.search(r"(\d+(?:\.\d+)?)\s*tbr", video_line)
             if m4:
                 fps = float(m4.group(1))
-
-    rotation = parse_rotation_from_ffmpeg_log(log)
+    
+    # Check for rotation purely for display purposes in the UI
+    rotation = 0
+    m_rot = re.search(r"rotate\s*:\s*(\d+)", log)
+    if m_rot:
+        rotation = int(m_rot.group(1))
+    elif re.search(r"rotation of\s*90", log):
+        rotation = 90
+    elif re.search(r"rotation of\s*-90", log):
+        rotation = 270 # -90 usually means 270 in metadata
 
     return {
         "duration": duration,
         "fps": fps,
         "width": width,
         "height": height,
-        "rotation": rotation,  # <-- important for portrait videos
+        "rotation": rotation,
         "raw_log": log,
     }
 
 
 def gif_safe_fps(requested_fps: float, min_delay_cs: int = 2) -> tuple[float, str, int]:
     """
-    GIF stores frame delays in centiseconds (1/100 s).
-    We quantize FPS to an exactly representable delay to avoid "GIF plays slower" issues.
-
-    delay_cs = round(100 / fps), but at least min_delay_cs (default 2 -> 20ms -> max 50 fps).
-    Returns: (effective_fps_float, ffmpeg_fps_expr, delay_cs)
+    Aligns FPS to GIF centisecond delays (1/100s) to prevent playback speed drift.
     """
     if not requested_fps or requested_fps <= 0:
         requested_fps = 15.0
 
+    # Calculate delay in centiseconds
     delay_cs = int(round(100.0 / float(requested_fps)))
+    # Clamp delay (min 2 = 50fps max)
     delay_cs = max(min_delay_cs, min(100, delay_cs))
-    fps_expr = f"100/{delay_cs}"  # exact rational
+    
+    fps_expr = f"100/{delay_cs}"
     effective_fps = 100.0 / delay_cs
     return effective_fps, fps_expr, delay_cs
-
-
-def rotation_filter(rotation_deg: int) -> str:
-    """
-    Build a filter snippet to apply the same orientation as the video player would.
-    We also disable ffmpeg autorotate and do it ourselves to be consistent.
-    """
-    rotation_deg = int(rotation_deg) % 360
-    if rotation_deg == 90:
-        return "transpose=1,"  # clockwise
-    if rotation_deg == 270:
-        return "transpose=2,"  # counter-clockwise
-    if rotation_deg == 180:
-        return "hflip,vflip,"
-    return ""
 
 
 def video_to_gif(
@@ -148,7 +117,6 @@ def video_to_gif(
     max_colors: int,
     dither: str,
     loop_forever: bool,
-    rotation_deg: int,
 ) -> None:
     clip_dur = float(end_s) - float(start_s)
     if clip_dur <= 0:
@@ -156,16 +124,17 @@ def video_to_gif(
 
     scale_factor = max(1, int(scale_pct)) / 100.0
 
-    rot = rotation_filter(rotation_deg)
-
-    # Key fixes for "portrait layout":
-    # 1) Disable ffmpeg autorotate (-noautorotate)
-    # 2) Apply rotation metadata ourselves (transpose/hflip/vflip)
-    # 3) Force square pixels (setsar=1) so GIF displays with correct aspect everywhere
+    # SCALE FILTER EXPLANATION:
+    # 1. We allow FFmpeg to auto-rotate the input (default behavior). 
+    #    So 'iw' and 'ih' are the correct Display Width/Height.
+    # 2. We use 'iw*factor' and '-2' for height. 
+    #    The '-2' tells FFmpeg to calculate height automatically but keep it divisible by 2 
+    #    (required by some codecs/formats, safer for GIF).
+    # 3. setsar=1 forces Square Pixels. This fixes "squished" looking GIFs on some players.
+    
     vf = (
-        f"{rot}"
         f"fps={fps_expr},"
-        f"scale=iw*{scale_factor}:ih*{scale_factor}:flags=lanczos,"
+        f"scale=iw*{scale_factor}:-2:flags=lanczos,"
         f"setsar=1,"
         f"split[s0][s1];"
         f"[s0]palettegen=max_colors={max_colors}:stats_mode=diff[p];"
@@ -175,27 +144,28 @@ def video_to_gif(
     cmd = [
         FFMPEG_PATH,
         "-y",
-        "-ss",
-        str(start_s),
-        "-t",
-        str(clip_dur),
-        "-noautorotate",  # IMPORTANT: prevent double/ignored rotation behavior differences
-        "-i",
-        input_path,
+        "-ss", str(start_s),
+        "-t", str(clip_dur),
+        # Removed "-noautorotate" -> This fixes the portrait issue. 
+        # FFmpeg will now apply the rotation metadata automatically before the filter graph.
+        "-i", input_path,
         "-an",
-        "-vf",
-        vf,
-        "-loop",
-        "0" if loop_forever else "-1",
+        "-vf", vf,
+        "-loop", "0" if loop_forever else "-1",
         output_path,
     ]
 
     rc, log = run(cmd)
+    
+    # Check if file exists and has size
     if rc != 0 or (not os.path.exists(output_path)) or os.path.getsize(output_path) == 0:
-        raise RuntimeError(f"ffmpeg failed.\n\nCommand:\n{' '.join(cmd)}\n\nLog:\n{log}")
+        raise RuntimeError(f"FFmpeg failed.\n\nLog:\n{log}")
 
 
-st.title("Video → GIF (quality-focused)")
+# --- STREAMLIT UI ---
+
+st.title("Video → GIF (Auto-Portrait Fix)")
+st.markdown("Creates high-quality GIFs. Automatically detects phone orientation.")
 
 uploaded = st.file_uploader("Upload a video", type=["mp4", "mov", "mkv", "webm", "avi", "m4v"])
 
@@ -212,30 +182,30 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix
     tmp.write(uploaded.read())
     video_path = tmp.name
 
+# Probe video
 info = probe_video_with_ffmpeg(video_path)
 
 col1, col2 = st.columns(2)
 with col1:
-    st.subheader("Video preview")
+    st.subheader("Preview")
     st.video(uploaded)
 
 with col2:
-    st.subheader("Video info")
-    if info["width"] and info["height"]:
-        st.write(f"Encoded resolution: **{info['width']}×{info['height']}**")
-    else:
-        st.write("Encoded resolution: **Unknown**")
-
-    st.write(f"Rotation metadata: **{info['rotation']}°**")
-    st.write(f"FPS (detected): **{info['fps']:.3f}**" if info["fps"] else "FPS (detected): **Unknown**")
+    st.subheader("Details")
+    st.write(f"Resolution: **{info['width']}×{info['height']}**")
+    if info['rotation']:
+        st.write(f"Orientation: **Rotated {info['rotation']}°** (Will be fixed automatically)")
     st.write(f"Duration: **{info['duration']:.2f} s**" if info["duration"] else "Duration: **Unknown**")
+    st.write(f"FPS: **{info['fps']:.2f}**" if info["fps"] else "FPS: **Unknown**")
 
 st.divider()
-st.subheader("GIF settings")
+
+# --- CONTROLS ---
 
 detected_fps = float(info["fps"] or 30.0)
 duration = float(info["duration"] or 0.0)
 
+# Time Trimming
 if duration > 0:
     default_end = min(duration, 5.0)
     start_s, end_s = st.slider(
@@ -244,59 +214,40 @@ if duration > 0:
         max_value=duration,
         value=(0.0, float(default_end)),
         step=0.1,
-        help="Select the time range to convert.",
     )
 else:
-    st.warning("Could not detect duration; using manual start/end inputs.")
     start_s = st.number_input("Start time (s)", min_value=0.0, value=0.0, step=0.1)
     end_s = st.number_input("End time (s)", min_value=0.1, value=5.0, step=0.1)
 
-use_original_fps = st.checkbox("Use original video FPS (recommended)", value=True)
-
+# FPS Controls
+use_original_fps = st.checkbox("Keep original FPS", value=True)
 if use_original_fps:
     requested_fps = detected_fps
 else:
-    requested_fps = float(
-        st.slider(
-            "Output GIF FPS (regulator)",
-            min_value=1,
-            max_value=60,
-            value=min(60, max(1, int(round(detected_fps)))),
-            step=1,
-            help="We auto-adjust to a GIF-safe FPS so playback speed doesn't drift.",
-        )
-    )
+    requested_fps = st.slider("Output FPS", 1, 60, 15)
 
-effective_fps, fps_expr, delay_cs = gif_safe_fps(requested_fps, min_delay_cs=2)
-st.caption(
-    f"Requested FPS: {requested_fps:.3f} → GIF-safe FPS: **{effective_fps:.6f}** "
-    f"(frame delay = {delay_cs} cs = {delay_cs*10} ms)."
-)
+effective_fps, fps_expr, delay_cs = gif_safe_fps(requested_fps)
 
+# Dimensions
 scale_pct = st.select_slider(
-    "Output size (keeps same layout/aspect ratio)",
+    "Resolution Scale (%)",
     options=[25, 50, 75, 100],
     value=100,
-    help="100% keeps the same pixel resolution (after applying rotation metadata if present).",
+    help="100% keeps the display resolution of the video."
 )
 
-with st.expander("Advanced quality controls"):
-    max_colors = st.slider(
-        "Max colors (GIF limit is 256)",
-        min_value=32,
-        max_value=256,
-        value=256,
-        step=16,
-    )
-    dither = st.selectbox(
-        "Dithering",
-        options=["sierra2_4a", "bayer:bayer_scale=3", "none"],
-        index=0,
-    )
-
-loop_forever = st.checkbox("Loop GIF forever", value=True)
+# Advanced Settings
+with st.expander("Advanced Settings"):
+    c1, c2 = st.columns(2)
+    with c1:
+        max_colors = st.slider("Max Colors", 32, 256, 256, step=16)
+    with c2:
+        dither = st.selectbox("Dithering Method", ["sierra2_4a", "bayer:bayer_scale=3", "none"], index=0)
+    loop_forever = st.checkbox("Loop Forever", value=True)
 
 st.session_state.gif_name = Path(uploaded.name).stem + ".gif"
+
+# --- GENERATION ---
 
 if st.button("Generate GIF", type="primary"):
     st.session_state.gif_bytes = None
@@ -306,7 +257,7 @@ if st.button("Generate GIF", type="primary"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".gif") as out_tmp:
             gif_path = out_tmp.name
 
-        with st.spinner("Converting (portrait/rotation-aware, high-quality palette)…"):
+        with st.spinner("Processing..."):
             video_to_gif(
                 input_path=video_path,
                 output_path=gif_path,
@@ -317,40 +268,41 @@ if st.button("Generate GIF", type="primary"):
                 max_colors=int(max_colors),
                 dither=str(dither),
                 loop_forever=bool(loop_forever),
-                rotation_deg=int(info["rotation"]),
+                # Note: We no longer pass rotation explicitly. FFmpeg handles it.
             )
 
         with open(gif_path, "rb") as f:
             st.session_state.gif_bytes = f.read()
 
-        st.success(f"GIF created: {human_size(len(st.session_state.gif_bytes))}")
+        st.success(f"Done! Size: {human_size(len(st.session_state.gif_bytes))}")
 
     except Exception as e:
-        st.error(f"Error during conversion: {e}")
-
+        st.error(f"Error: {e}")
     finally:
-        try:
-            if gif_path and os.path.exists(gif_path):
-                os.remove(gif_path)
-        except Exception:
-            pass
+        # Cleanup generated file from disk (it's in memory now)
+        if gif_path and os.path.exists(gif_path):
+            os.remove(gif_path)
 
-st.divider()
-st.subheader("GIF preview (before download)")
+# --- DISPLAY RESULT ---
 
 if st.session_state.gif_bytes:
-    st.image(st.session_state.gif_bytes, caption="Preview", use_container_width=True)
+    st.divider()
+    st.subheader("Result")
+    
+    # We use use_container_width=True to ensure it fits the layout,
+    # but since the aspect ratio is now correct, it won't look squished.
+    st.image(st.session_state.gif_bytes, caption="Generated GIF", use_container_width=True)
+    
     st.download_button(
-        "Download GIF",
+        label="Download GIF",
         data=st.session_state.gif_bytes,
-        file_name=st.session_state.gif_name or "output.gif",
+        file_name=st.session_state.gif_name,
         mime="image/gif",
     )
-else:
-    st.info("Generate a GIF to preview it here.")
 
-# Cleanup temp uploaded video
+# Cleanup source
 try:
-    os.remove(video_path)
-except Exception:
+    if os.path.exists(video_path):
+        os.remove(video_path)
+except:
     pass
