@@ -27,13 +27,39 @@ def run(cmd: list[str]) -> tuple[int, str]:
     return p.returncode, log
 
 
+def parse_rotation_from_ffmpeg_log(log: str) -> int:
+    """
+    Many portrait phone videos are stored as landscape frames + rotation metadata.
+    If we don't apply that rotation, the output GIF "layout" looks wrong.
+
+    Returns rotation in {0, 90, 180, 270}.
+    """
+    # Common forms:
+    #   rotate          : 90
+    #   Side data: displaymatrix: rotation of 90.00 degrees
+    m = re.search(r"rotate\s*:\s*(-?\d+(?:\.\d+)?)", log)
+    if not m:
+        m = re.search(r"rotation of\s*(-?\d+(?:\.\d+)?)\s*degrees", log, flags=re.IGNORECASE)
+
+    if not m:
+        return 0
+
+    deg = float(m.group(1))
+    deg = int(round(deg)) % 360
+    # Normalize to nearest right angle
+    candidates = [0, 90, 180, 270]
+    deg = min(candidates, key=lambda x: abs(x - deg))
+    return deg
+
+
 def probe_video_with_ffmpeg(video_path: str) -> dict:
     """
-    Uses `ffmpeg -i` output to parse duration, fps, width, height.
-    Avoids MoviePy/Pillow compatibility issues.
+    Uses `ffmpeg -i` output to parse duration, fps, width, height, rotation.
+    Avoids MoviePy (Pillow>=10 issues with ANTIALIAS).
     """
     cmd = [FFMPEG_PATH, "-hide_banner", "-i", video_path]
     rc, log = run(cmd)
+    # Note: ffmpeg -i typically returns non-zero; we parse the log anyway.
 
     # Duration
     duration = 0.0
@@ -53,7 +79,7 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
     fps = 0.0
 
     if video_line:
-        # Resolution
+        # Resolution: look for "####x####"
         m2 = re.search(r"(\d{2,5})x(\d{2,5})", video_line)
         if m2:
             width, height = int(m2.group(1)), int(m2.group(2))
@@ -67,27 +93,49 @@ def probe_video_with_ffmpeg(video_path: str) -> dict:
             if m4:
                 fps = float(m4.group(1))
 
-    return {"duration": duration, "fps": fps, "width": width, "height": height, "raw_log": log}
+    rotation = parse_rotation_from_ffmpeg_log(log)
+
+    return {
+        "duration": duration,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "rotation": rotation,  # <-- important for portrait videos
+        "raw_log": log,
+    }
 
 
 def gif_safe_fps(requested_fps: float, min_delay_cs: int = 2) -> tuple[float, str, int]:
     """
-    GIF frame delays are stored in centiseconds (1/100 s). Many players also clamp very small delays.
-    If you ask for e.g. 60 fps (16.67 ms), it often gets rounded/clamped to 20 ms -> plays slower.
+    GIF stores frame delays in centiseconds (1/100 s).
+    We quantize FPS to an exactly representable delay to avoid "GIF plays slower" issues.
 
-    We quantize to an *exactly representable* GIF frame delay:
-      delay_cs = round(100 / fps), but at least min_delay_cs (default 2 -> 20 ms -> max 50 fps).
-      effective_fps = 100 / delay_cs (exact)
+    delay_cs = round(100 / fps), but at least min_delay_cs (default 2 -> 20ms -> max 50 fps).
     Returns: (effective_fps_float, ffmpeg_fps_expr, delay_cs)
     """
     if not requested_fps or requested_fps <= 0:
         requested_fps = 15.0
 
     delay_cs = int(round(100.0 / float(requested_fps)))
-    delay_cs = max(min_delay_cs, min(100, delay_cs))  # clamp to [min_delay_cs..100]
-    fps_expr = f"100/{delay_cs}"  # exact rational in ffmpeg
+    delay_cs = max(min_delay_cs, min(100, delay_cs))
+    fps_expr = f"100/{delay_cs}"  # exact rational
     effective_fps = 100.0 / delay_cs
     return effective_fps, fps_expr, delay_cs
+
+
+def rotation_filter(rotation_deg: int) -> str:
+    """
+    Build a filter snippet to apply the same orientation as the video player would.
+    We also disable ffmpeg autorotate and do it ourselves to be consistent.
+    """
+    rotation_deg = int(rotation_deg) % 360
+    if rotation_deg == 90:
+        return "transpose=1,"  # clockwise
+    if rotation_deg == 270:
+        return "transpose=2,"  # counter-clockwise
+    if rotation_deg == 180:
+        return "hflip,vflip,"
+    return ""
 
 
 def video_to_gif(
@@ -100,6 +148,7 @@ def video_to_gif(
     max_colors: int,
     dither: str,
     loop_forever: bool,
+    rotation_deg: int,
 ) -> None:
     clip_dur = float(end_s) - float(start_s)
     if clip_dur <= 0:
@@ -107,10 +156,17 @@ def video_to_gif(
 
     scale_factor = max(1, int(scale_pct)) / 100.0
 
-    # High-quality GIF approach: palettegen + paletteuse
+    rot = rotation_filter(rotation_deg)
+
+    # Key fixes for "portrait layout":
+    # 1) Disable ffmpeg autorotate (-noautorotate)
+    # 2) Apply rotation metadata ourselves (transpose/hflip/vflip)
+    # 3) Force square pixels (setsar=1) so GIF displays with correct aspect everywhere
     vf = (
+        f"{rot}"
         f"fps={fps_expr},"
         f"scale=iw*{scale_factor}:ih*{scale_factor}:flags=lanczos,"
+        f"setsar=1,"
         f"split[s0][s1];"
         f"[s0]palettegen=max_colors={max_colors}:stats_mode=diff[p];"
         f"[s1][p]paletteuse=dither={dither}"
@@ -123,6 +179,7 @@ def video_to_gif(
         str(start_s),
         "-t",
         str(clip_dur),
+        "-noautorotate",  # IMPORTANT: prevent double/ignored rotation behavior differences
         "-i",
         input_path,
         "-an",
@@ -139,15 +196,6 @@ def video_to_gif(
 
 
 st.title("Video → GIF (quality-focused)")
-
-st.markdown(
-    """
-**Notes about speed (important):**
-- GIF stores frame delays in **1/100 second** steps (centiseconds).
-- If you request FPS that doesn't map cleanly to that (common: **60 fps**), many GIFs end up playing **slower** due to rounding/clamping.
-- This app automatically adjusts your requested FPS to a **GIF-safe FPS** so playback speed matches the original timing much better.
-"""
-)
 
 uploaded = st.file_uploader("Upload a video", type=["mp4", "mov", "mkv", "webm", "avi", "m4v"])
 
@@ -174,10 +222,11 @@ with col1:
 with col2:
     st.subheader("Video info")
     if info["width"] and info["height"]:
-        st.write(f"Resolution: **{info['width']}×{info['height']}**")
+        st.write(f"Encoded resolution: **{info['width']}×{info['height']}**")
     else:
-        st.write("Resolution: **Unknown**")
+        st.write("Encoded resolution: **Unknown**")
 
+    st.write(f"Rotation metadata: **{info['rotation']}°**")
     st.write(f"FPS (detected): **{info['fps']:.3f}**" if info["fps"] else "FPS (detected): **Unknown**")
     st.write(f"Duration: **{info['duration']:.2f} s**" if info["duration"] else "Duration: **Unknown**")
 
@@ -214,24 +263,21 @@ else:
             max_value=60,
             value=min(60, max(1, int(round(detected_fps)))),
             step=1,
-            help="Lower FPS reduces size; higher FPS increases smoothness. Non-GIF-safe FPS can play slower due to GIF timing limits, so we auto-adjust.",
+            help="We auto-adjust to a GIF-safe FPS so playback speed doesn't drift.",
         )
     )
 
-# Make FPS GIF-safe to avoid slow playback due to centisecond rounding/clamping
 effective_fps, fps_expr, delay_cs = gif_safe_fps(requested_fps, min_delay_cs=2)
-
 st.caption(
-    f"Requested FPS: {requested_fps:.3f} → **GIF-safe FPS: {effective_fps:.6f}** "
-    f"(frame delay = {delay_cs} cs = {delay_cs*10} ms). "
-    f"This prevents the common 'GIF plays slower than video' issue."
+    f"Requested FPS: {requested_fps:.3f} → GIF-safe FPS: **{effective_fps:.6f}** "
+    f"(frame delay = {delay_cs} cs = {delay_cs*10} ms)."
 )
 
 scale_pct = st.select_slider(
     "Output size (keeps same layout/aspect ratio)",
     options=[25, 50, 75, 100],
     value=100,
-    help="100% keeps the same resolution as the video. Lower values reduce file size.",
+    help="100% keeps the same pixel resolution (after applying rotation metadata if present).",
 )
 
 with st.expander("Advanced quality controls"):
@@ -254,23 +300,24 @@ st.session_state.gif_name = Path(uploaded.name).stem + ".gif"
 
 if st.button("Generate GIF", type="primary"):
     st.session_state.gif_bytes = None
-
     gif_path = None
+
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".gif") as out_tmp:
             gif_path = out_tmp.name
 
-        with st.spinner("Converting (high-quality palette)…"):
+        with st.spinner("Converting (portrait/rotation-aware, high-quality palette)…"):
             video_to_gif(
                 input_path=video_path,
                 output_path=gif_path,
                 start_s=float(start_s),
                 end_s=float(end_s),
-                fps_expr=fps_expr,  # IMPORTANT: GIF-safe FPS expression
+                fps_expr=fps_expr,
                 scale_pct=int(scale_pct),
                 max_colors=int(max_colors),
                 dither=str(dither),
                 loop_forever=bool(loop_forever),
+                rotation_deg=int(info["rotation"]),
             )
 
         with open(gif_path, "rb") as f:
